@@ -1,0 +1,7 @@
+<svg width="640" height="420" viewBox="0 0 640 420" xmlns="http://www.w3.org/2000/svg">
+  <rect width="640" height="420" rx="32" fill="#FFF1F5"/>
+  <circle cx="320" cy="170" r="112" fill="#FF9EC6"/>
+  <rect x="180" y="242" width="280" height="42" rx="20" fill="#A85D7E"/>
+  <text x="320" y="180" text-anchor="middle" font-size="88">🍰</text>
+  <text x="320" y="340" text-anchor="middle" font-size="34" fill="#A84A75">甜品下午茶</text>
+</svg>
