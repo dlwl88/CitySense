@@ -10,6 +10,7 @@
 - Redisson 布隆过滤器，预先拦截明显不存在的店铺和优惠券 ID；
 - Redis Lua 脚本与 RocketMQ，实现秒杀资格校验、异步下单和超时关单；
 - 注解 + AOP + Redis ZSet + Lua 的滑动窗口限流；
+- Redis Lua 实时点赞计数与 XXL-JOB 合并批量落库，减少热门笔记的数据库写入；
 - 基于 Spring AI、Milvus 与 SSE 的多轮本地生活 AI Agent；
 - 会话、消息、工具调用日志持久化，以及平台知识、店铺画像、探店笔记三类 RAG 索引。
 
@@ -23,6 +24,7 @@
 | 数据库 | MySQL 8、MyBatis-Plus 3.5.5 | 核心业务数据与 AI 会话数据持久化 |
 | 缓存与协调 | Redis、Spring Data Redis、Redisson 3.27.2 | 缓存、会话、GEO、Lua、布隆过滤器、锁、限流 |
 | 消息队列 | RocketMQ Spring 2.3.3 | 秒杀订单异步落库、延迟关单 |
+| 任务调度 | XXL-JOB 2.4.1 | 定时合并点赞快照，批量同步 MySQL |
 | AI 与向量检索 | Spring AI 1.0.3、OpenAI 兼容接口、Milvus | 对话、Embedding、向量检索和 RAG |
 | 前端 | Vue 3、Vite 4、Vue Router、Pinia、Element Plus、Axios、Sass | 同城生活服务与 AI 助手界面 |
 
@@ -38,13 +40,14 @@
 |  |- config/               # MVC、Redis、Redisson、MQ、异常处理配置
 |  |- component/            # 启动预热、异步执行协调器
 |  |- mq/                   # RocketMQ 消费者
+|  |- job/                  # XXL-JOB 点赞同步任务
 |  |- utils/                # 缓存、ID、拦截器、锁、限流工具
 |  `- ai/                   # Agent、记忆、RAG、向量索引、MCP
 |- src/main/resources/
 |  |- application.yaml      # 默认运行与 AI 配置
-|  |- db/                   # hmdp.sql、ai-agent.sql 数据库脚本
+|  |- db/                   # 初始化 SQL 与点赞版本字段迁移
 |  |- knowledge/            # RAG 本地知识文档
-|  |- *.lua                 # 秒杀、解锁、限流 Lua 脚本
+|  |- *.lua                 # 秒杀、解锁、限流、点赞及落库确认脚本
 |  `- static/               # Vite 构建后的生产前端资源
 |- frontend-vue/
 |  |- src/api/              # Axios 客户端和接口模块
@@ -83,6 +86,38 @@
 ### 4.3 探店笔记与社交关系
 
 笔记模块支持发布、热门分页、详情、点赞、点赞用户排行、作者笔记和关注流。点赞关系使用 Redis ZSet：既能判断/切换用户是否点赞，也能按时间或分值获取点赞用户 TopN。
+
+点赞采用“Redis 实时处理、XXL-JOB 合并落库”的最终一致性链路，保留切换式 `PUT /blog/like/{id}` 和 `Result.ok()` 响应。前端沿用接口，增加同一笔记的请求锁与操作后回查。正常点击不更新 MySQL；首次缺少计数时才按需读取数据库初始化。
+
+```text
+点赞请求 -> blog_like.lua：切换 ZSet + 更新 count/version + 标记 dirty
+         -> 返回成功
+XXL-JOB -> HSCAN 待同步笔记 -> 单篇 HGETALL 读取一致快照
+        -> 每批最多 500 个快照 -> 数据库事务中的 JDBC batch
+        -> 提交成功 -> blog_like_ack.lua 按版本确认
+```
+
+| Redis Key | 类型 | 职责 |
+| --- | --- | --- |
+| `blog:liked:笔记ID` | ZSet | 用户 ID 与点赞时间，沿用原有状态及 TopN 查询 |
+| `blog:like:meta:笔记ID` | Hash | `count` 实时总数、`version` 递增版本 |
+| `blog:like:dirty` | Hash | `笔记ID → 最近变化版本`，合并同一笔记多次变化 |
+
+**初始化与 Lua。** `initializeLikeMeta()` 只在冷初始化时获取 `lock:blog:like:init:笔记ID`。加锁后再次检查 Redis，只查 MySQL 的 `id/liked/like_version`；历史总数以数据库为基线，不能用缺少历史用户的 ZSet 数量覆盖。计数缺失但 dirty 仍在时直接报错，保留变化并等待恢复，不用滞后的数据库值重新初始化。Lua 保证状态、计数、版本与 dirty 的更新不被其他请求穿插；不提供脚本出错自动回滚，也不包含 MySQL 事务。当前为单机 Redis；迁移到 Cluster 时需将脚本涉及的 key 按同一槽分组，并设计分片 dirty 集合，不能直接沿用全局 Hash。
+
+**合并落库。** `BlogLikeSyncJob` 使用 `lock:blog:like:sync` 避免多实例重复扫描和写库。HSCAN 遍历一轮，不一次读出整个 dirty；单篇笔记一次 HGETALL 读取 count/version。每批最多 500 个快照，数值型 ID 只解析一次，`TransactionTemplate` 初始化后复用。执行 SQL：
+
+```sql
+UPDATE tb_blog SET liked = ?, like_version = ?
+WHERE id = ? AND like_version < ?;
+```
+
+**失败重试与确认。** 版本条件阻止重复快照和旧任务覆盖新结果。HSCAN 可能重复返回字段，正确性依靠版本保护。数据库事务提交后，确认 Lua 仅在 dirty 版本仍等于本次快照时删除标记；同步期间的新点击保留到下一轮。写库失败不清标记；提交后 Redis 确认失败也向调度器报告失败，后续调度可以重复同步。这里保留的是最新快照，不是每次点击的审计日志。
+
+**实时查询与收益。** `fillLikeCounts()` 在详情、热榜、关注流、我的笔记和作者笔记中用 Redis 总数补齐，列表通过 pipeline 减少往返，缺少计数时保留数据库值。热榜仍按 MySQL `liked` 排序，延迟包含调度周期、运行时间和故障积压，不能保证严格在 5 秒内同步。同一笔记两次同步间的多次点击通常合并为一次计数更新；请求分散到大量不同笔记时，合并收益较小。
+
+**恢复边界。** 计数、版本、dirty 不设 TTL，点赞关系仍只存在 Redis，需要持久化、备份并防止内存淘汰。完整 Redis 丢失或故障切换丢写没有自动无损恢复，需要恢复与对账；计数和版本必须一起恢复，不能单独重置版本。接口继续沿用“每次请求切换状态”，网络重试会再次切换；请求幂等需后续改成明确目标状态或增加请求去重。
+
 
 关注关系持久化到 MySQL，同时同步到 Redis Set，便于查询共同关注。用户发布笔记后，笔记 ID 可投递到粉丝收件箱，前端通过滚动分页读取关注流。
 
@@ -181,8 +216,11 @@ AI 模块是事件驱动的多轮 Agent，不是单次同步问答接口：
 | --- | --- |
 | `hmdp.sql` | 店铺、分类、用户、用户详情、优惠券、秒杀库存、订单、笔记、评论、关注关系及演示数据 |
 | `ai-agent.sql` | AI 会话和 AI 消息表 |
+| `add_blog_like_version.sql` | 一次性给 `tb_blog` 增加非空、默认 0 的 `like_version` 字段 |
 
 核心业务表以 `tb_` 开头。`tb_voucher_order` 的订单状态同时被支付回调和延迟关单逻辑使用，测试异步链路时不建议手动修改其状态。
+
+已有数据库只执行新增字段迁移，不能重新运行包含 DROP TABLE 的初始化脚本。切换异步点赞前停止旧版点赞写入，避免旧服务同步加减与新版快照相互覆盖。`Blog.likeVersion` 通过 `@JsonIgnore` 保持 JSON 接口字段不变。
 
 ## 6. 运行依赖
 
@@ -196,6 +234,7 @@ AI 模块是事件驱动的多轮 Agent，不是单次同步问答接口：
 | MySQL | `localhost:3306`，数据库 `hmdp` | 业务数据、AI 历史数据 |
 | Redis | `localhost:6379` | 登录、缓存、锁、限流、秒杀 |
 | RocketMQ | NameServer `localhost:9876` | 异步秒杀和超时订单 |
+| XXL-JOB | 管理端 2.4.1 默认 `localhost:8081/xxl-job-admin`，执行器端口 9999 | 点赞定时批量同步，管理端需单独部署 |
 | Milvus | `localhost:19530` | AI 向量检索 |
 | OpenAI 兼容 Chat/Embedding 服务 | 由环境变量配置 | 大模型对话和向量生成 |
 
@@ -211,9 +250,10 @@ AI 模块是事件驱动的多轮 Agent，不是单次同步问答接口：
 mysql -u root -p -e "CREATE DATABASE hmdp DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
 mysql -u root -p hmdp < src/main/resources/db/hmdp.sql
 mysql -u root -p hmdp < src/main/resources/db/ai-agent.sql
+mysql -u root -p hmdp < src/main/resources/db/add_blog_like_version.sql
 ```
 
-Windows PowerShell 对重定向的支持取决于 MySQL 客户端版本；若命令无法执行，可使用 MySQL Workbench、Navicat 或其他图形化客户端顺序执行两个脚本。
+上述重定向命令按支持输入重定向的终端使用；PowerShell 用户可使用 MySQL 客户端的 SOURCE 命令，或在 Workbench、Navicat 中顺序执行三个脚本。版本字段迁移只执行一次。
 
 ### 7.2 配置并启动后端
 
@@ -266,6 +306,27 @@ java -jar target/hm-dianping-0.0.1-SNAPSHOT.jar
 ```
 
 Vite 构建目录是 `src/main/resources/static`，因此 Spring Boot 可在同源下同时提供页面和 API。前端配置启用了 `emptyOutDir: true`，每次生产构建会清空并重新生成该静态资源目录。
+
+### 7.5 配置 XXL-JOB 点赞同步
+
+1. 执行 `add_blog_like_version.sql`，单独部署 XXL-JOB 2.4.1 管理端；客户端版本由 `pom.xml` 的 `xxl-job.version` 管理。
+2. 设置管理端地址和访问令牌，与管理端配置保持一致。执行器默认 appname 为 `cityaihub-like-executor`，端口为 9999。
+3. 在管理端添加该 appname 的执行器，使用自动注册或手动地址。容器或多网卡环境配置管理端能够回调的 IP 或完整执行器地址。
+4. 创建 Bean 任务，JobHandler 为 `blogLikeSyncJob`；建议每 5 秒触发，路由“第一个”，阻塞策略“丢弃后续调度”，配置失败重试和告警，然后启动任务。
+5. 检查 Redis 计数与数据库快照趋于一致，并监控 dirty 积压。仅启动后端或注册执行器不会自动创建、触发任务。
+
+| 环境变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `XXL_JOB_ENABLED` | `true` | 是否启动执行器；关闭后仍写 Redis，但数据库不再由调度同步 |
+| `XXL_JOB_ADMIN_ADDRESSES` | `http://127.0.0.1:8081/xxl-job-admin` | 调度中心地址 |
+| `XXL_JOB_ACCESS_TOKEN` | 空 | 与管理端一致的访问令牌 |
+| `XXL_JOB_APPNAME` | `cityaihub-like-executor` | 执行器注册名称 |
+| `XXL_JOB_EXECUTOR_ADDRESS` | 空 | 完整的可回调执行器地址，留空则自动生成 |
+| `XXL_JOB_EXECUTOR_IP` | 空 | 注册 IP，留空则自动选择 |
+| `XXL_JOB_EXECUTOR_PORT` | `9999` | 执行器监听端口 |
+| `XXL_JOB_LOG_PATH` | `logs/xxl-job` | 调度日志目录，保留 7 天 |
+
+任务停用时 dirty 保留并增长，不能把关闭执行器作为长期正常运行方式。重点监控任务失败、耗时、dirty 数量、数据库写 QPS 和行锁等待。接入 API 参考 [XXL-JOB 2.4.1 官方示例](https://github.com/xuxueli/xxl-job/blob/2.4.1/xxl-job-executor-samples/xxl-job-executor-sample-springboot/src/main/java/com/xxl/job/executor/core/config/XxlJobConfig.java)。
 
 ## 8. AI 配置说明
 
@@ -342,6 +403,14 @@ Vite 构建目录是 `src/main/resources/static`，因此 Spring Boot 可在同�
 
 前端已同步支付与超时关单的状态处理：详情页按后端状态区分创建中、待支付、已支付和已取消，仅待支付订单可提交支付；历史订单重新进入页面时会刷新状态。支付前查询状态，操作后同步结果，抢锁失败、状态变化或请求超时后回查后端并更新本地记录，不自动重发支付请求。查询失败时显示状态待确认并禁用支付，待用户查状态成功后恢复。创建中状态 `0` 同时用于详情页和个人中心展示。
 
+### 10.1 点赞交互与实时计数
+
+首页的点赞接口成功响应不包含计数，因此提交后查询 `GET /blog/{id}`，将后端返回的 `liked`、`isLike` 同时写入热榜卡片和详情弹窗，替代原先本地计数加减。后端从 Redis 补齐计数，页面无需等待 XXL-JOB 落库；这会增加一次详情读取，但不会增加点赞写库，也没有新增定时轮询。
+
+`frontend-vue/src/composables/useBlogLikes.js` 统一处理同一笔记的请求互斥与结果待确认状态：提交及查询期间锁住列表与弹窗按钮，不同笔记可并行操作。明确的 `Result.fail` 由 Axios 标记为业务错误并展示；超时、传输错误或提交成功后的查询失败无法确认最终状态，按钮改为“刷新状态”，再次点击仅发 GET，查询成功后恢复切换操作。旧计数在回查成功前仅作为最近一次已知值展示。该保护不等于后端幂等，不能解决跨设备重复请求。
+
+登录、退出或切换账号时清理当前笔记状态并重新查询，丢弃旧会话响应；列表与详情查询也防止旧列表覆盖已更新的计数。首页支持“刷新热榜”，个人中心支持“刷新笔记”，打开个人笔记详情时重新查询后端而非直接展示列表缓存。刷新失败保留已有列表。热门排序仍按数据库计数，可能落后于 Redis 实时计数；前端不自行重排当前页。
+
 ## 11. 测试与验证
 
 后端测试位于 `src/test/java`，包含基础工具、AI Agent、RAG、种子数据和 Agent 循环相关测试。
@@ -350,6 +419,7 @@ Vite 构建目录是 `src/main/resources/static`，因此 Spring Boot 可在同�
 mvn test
 
 Set-Location frontend-vue
+npm test
 npm run build
 ```
 
@@ -365,13 +435,24 @@ mvn '-Dtest=NormalTest' test
 
 2026-10-08 本次改进验证中，上述 9 个场景、原有 1 个基础测试及 10 个 AI 单元测试通过，共 20 项；订单回归套件也已复测通过。订单回归采用模拟存储、事务管理器及内存共享锁，未验证真实 Redis Lua 执行、Redisson 续期、数据库事务和 RocketMQ 投递，不等同于完整中间件联调。
 
+点赞回归测试位于 `BlogLikeSyncJobTest` 和 `BlogLikeLuaIntegrationTest`。前者模拟数据库及事务，验证提交后才确认、写库/提交失败不确认、确认失败可重试、抢锁失败不写库、缺失快照保留标记和 500 条分批。后者显式启用后连接本机 Redis，只操作随机命名的测试 key 并清理，验证真实 Lua 的并发切换、历史计数基线、旧确认保留新变化、64 位版本精度和非法扣减保护。
+
+```powershell
+mvn '-Dtest=BlogLikeSyncJobTest,BlogLikeLuaIntegrationTest,NormalTest' '-Dlike.redis.integration=true' test
+```
+
+2026-10-08 验证：后端编译成功，7 个点赞任务测试、6 个真实 Redis Lua 测试及 10 个原有基础/订单回归测试通过，共 23 项。未执行业务数据库迁移，也未验证真实 MySQL 落库和 XXL-JOB 管理端远程调度；这些需在部署环境联调。Redis 集成测试默认跳过，只有显式传入上述属性且本机 Redis 可用时执行。
+
+前端点赞测试位于 `frontend-vue/test/blog-likes.test.js`，通过模拟 API 验证真实交互逻辑：成功后回查实时计数、同一笔记重复点击和读写互斥、不同笔记并行、超时及回查失败后的只读恢复、明确业务拒绝、账号切换丢弃在途响应及无效详情保护。2026-10-08 执行 `npm test`，11 项通过；生产构建通过并更新 `src/main/resources/static`。尚未进行真实浏览器与部署后端的端到端联调。
+
 建议手工验证顺序：
 
 1. 启动 MySQL、Redis、RocketMQ 与后端，验证店铺和分类浏览。
 2. 登录后执行需要身份的操作，验证 token 传递和拦截器行为。
 3. 创建或使用秒杀券，观察订单从“等待落库”到订单状态可查的过程。
 4. 验证支付与关单的两种执行顺序：支付成功后等待超时消息，状态应保持已支付且不恢复库存；超时关单后再支付，状态应保持已取消且支付被拒绝。再重投同一超时消息，确认 MySQL 和 Redis 库存不重复增加；模拟锁竞争或 Redis 补偿失败，确认 MQ 重试后完成处理。需要验证 watchdog 时，可在隔离测试环境中使业务执行超过原先的 5 秒固定租期，确认同订单操作仍互斥。
-5. 配置 Milvus 与 AI 服务后，在 AI 页面新建会话并验证 SSE 增量输出。
+5. 完成点赞迁移并启动 XXL-JOB 任务，验证多个用户点赞后的 Redis 实时计数、数据库版本同步、失败重试和任务暂停后的积压恢复。
+6. 配置 Milvus 与 AI 服务后，在 AI 页面新建会话并验证 SSE 增量输出。
 
 ## 12. 部署与安全建议
 
@@ -388,6 +469,8 @@ mvn '-Dtest=NormalTest' test
 | --- | --- | --- |
 | 后端无法连接 MySQL | 数据库、账号或表结构未准备好 | 创建 `hmdp`，导入两个 SQL 脚本，检查数据源配置 |
 | 登录、缓存、限流异常 | Redis 未启动或地址不匹配 | 启动 Redis，检查 host/port |
+| 点赞实时显示但 MySQL 不更新 | XXL-JOB 未创建或未启动任务、执行器注册失败、写库失败 | 检查 blogLikeSyncJob 调度日志、地址/令牌与 dirty 积压 |
+| Unknown column like_version | 未执行点赞字段迁移 | 对已有数据库执行 add_blog_like_version.sql，不重跑初始化脚本 |
 | 秒杀成功但没有订单 | RocketMQ Broker/消费者不可用 | 检查 NameServer、Broker、Topic、生产者与消费者日志 |
 | 支付返回“订单处理中，请稍后重试” | 同一订单的创建支付、支付回调或关单正在持锁 | 稍后查询订单状态再重试，检查 `lock:order:订单ID` 对应操作耗时 |
 | 订单已取消但 Redis 库存尚未恢复 | 数据库已提交，Redis 补偿失败或消息正在重试 | 检查消费者重试/死信、Redis 连通性及 `seckill:rollback:订单ID` 标记，避免手工重复增加库存 |

@@ -53,7 +53,8 @@
         <section class="card-panel blog-panel">
           <div class="section-title">
             <h2>我的笔记</h2>
-            <p>真实联调 `/blog/of/me`</p>
+            <p>查看笔记与最新点赞数</p>
+            <el-button size="small" plain :loading="myBlogsLoading" @click="loadMyBlogs">刷新笔记</el-button>
           </div>
           <div class="my-blog-list">
             <article v-for="blog in myBlogs" :key="blog.id" class="my-blog-item hover-lift">
@@ -67,11 +68,11 @@
                 </div>
               </div>
               <div class="blog-actions">
-                <el-button size="small" @click="viewBlog(blog)">查看详情</el-button>
+                <el-button size="small" :disabled="blogDetailLoading" @click="viewBlog(blog)">查看详情</el-button>
                 <el-button v-if="blog.shopId" size="small" type="primary" @click="goShop(blog.shopId)">去店铺</el-button>
               </div>
             </article>
-            <div v-if="!myBlogs.length" class="empty-block">当前还没有发布笔记</div>
+            <div v-if="!myBlogs.length" class="empty-block">{{ myBlogsLoading ? '正在加载笔记...' : myBlogsError || '当前还没有发布笔记' }}</div>
           </div>
         </section>
       </template>
@@ -161,7 +162,7 @@
             <span>点赞 {{ blog.liked || 0 }} ｜ 评论 {{ blog.comments || 0 }} ｜ 店铺ID {{ blog.shopId || '-' }}</span>
           </div>
           <div class="panel-actions">
-            <el-button size="small" @click="viewBlog(blog)">查看详情</el-button>
+            <el-button size="small" :disabled="blogDetailLoading" @click="viewBlog(blog)">查看详情</el-button>
             <el-button v-if="blog.shopId" size="small" @click="goShop(blog.shopId)">去店铺</el-button>
           </div>
         </article>
@@ -231,6 +232,13 @@ const favoriteShops = ref([]);
 const publishing = ref(false);
 const blogDetailVisible = ref(false);
 const activeBlog = ref(null);
+const myBlogsLoading = ref(false);
+const myBlogsError = ref('');
+const blogDetailLoading = ref(false);
+let myBlogsRequestId = 0;
+let myBlogsRevision = 0;
+let blogDetailRequestId = 0;
+const getBlogSession = () => `${userStore.token}:${userStore.profile?.id || ''}`;
 
 const dialogs = reactive({
   favorites: false,
@@ -259,9 +267,18 @@ const menuEntries = [
 ];
 
 watch(
-  () => userStore.isLoggedIn,
-  (loggedIn) => {
-    if (loggedIn) {
+  getBlogSession,
+  () => {
+    myBlogsRequestId += 1;
+    blogDetailRequestId += 1;
+    myBlogs.value = [];
+    myBlogsError.value = '';
+    myBlogsLoading.value = false;
+    blogDetailLoading.value = false;
+    activeBlog.value = null;
+    blogDetailVisible.value = false;
+    Object.keys(dialogs).forEach((key) => { dialogs[key] = false; });
+    if (userStore.isLoggedIn) {
       loadProfile();
     }
   },
@@ -270,9 +287,36 @@ watch(
 
 async function loadProfile() {
   if (!userStore.isLoggedIn) return;
-  const data = await profileApi.getProfile();
-  profile.value = data.profile;
-  myBlogs.value = (await blogApi.getMy(1).catch(() => [])).map(normalizeBlog);
+  const session = getBlogSession();
+  await Promise.all([
+    profileApi.getProfile().then((data) => {
+      if (session === getBlogSession()) profile.value = data.profile;
+    }).catch((error) => {
+      if (session === getBlogSession()) ElMessage.error(error?.message || '加载个人信息失败');
+    }),
+    loadMyBlogs()
+  ]);
+}
+
+async function loadMyBlogs() {
+  if (!userStore.isLoggedIn) return;
+  const requestId = ++myBlogsRequestId;
+  const revision = myBlogsRevision;
+  const session = getBlogSession();
+  myBlogsLoading.value = true;
+  myBlogsError.value = '';
+  try {
+    const list = await blogApi.getMy(1);
+    if (requestId !== myBlogsRequestId || revision !== myBlogsRevision || session !== getBlogSession()) return;
+    myBlogs.value = (list || []).map(normalizeBlog);
+  } catch (error) {
+    if (requestId === myBlogsRequestId && session === getBlogSession()) {
+      myBlogsError.value = '笔记加载失败，请刷新重试';
+      ElMessage.error(error?.message || myBlogsError.value);
+    }
+  } finally {
+    if (requestId === myBlogsRequestId) myBlogsLoading.value = false;
+  }
 }
 
 function normalizeBlog(blog) {
@@ -390,9 +434,26 @@ function resetBlogForm() {
   blogForm.content = '';
 }
 
-function viewBlog(blog) {
-  activeBlog.value = normalizeBlog(blog);
-  blogDetailVisible.value = true;
+async function viewBlog(blog) {
+  if (blogDetailLoading.value) return;
+  const requestId = ++blogDetailRequestId;
+  const session = getBlogSession();
+  blogDetailLoading.value = true;
+  try {
+    const detail = await blogApi.getDetail(blog.id);
+    if (requestId !== blogDetailRequestId || session !== getBlogSession()) return;
+    myBlogsRevision += 1;
+    const latest = normalizeBlog({ ...blog, ...detail });
+    myBlogs.value = myBlogs.value.map((item) => String(item.id) === String(blog.id) ? latest : item);
+    activeBlog.value = latest;
+    blogDetailVisible.value = true;
+  } catch (error) {
+    if (requestId === blogDetailRequestId && session === getBlogSession()) {
+      ElMessage.error(error?.message || '加载笔记详情失败');
+    }
+  } finally {
+    if (requestId === blogDetailRequestId) blogDetailLoading.value = false;
+  }
 }
 
 function goShop(shopId) {

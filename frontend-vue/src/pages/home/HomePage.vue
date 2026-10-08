@@ -56,7 +56,8 @@
       <section class="blog-section card-panel">
         <div class="section-title">
           <h2>探店热榜</h2>
-          <p>真实联调 `/blog/hot` 与点赞接口</p>
+          <p>看看大家喜欢的探店笔记</p>
+          <el-button size="small" plain :loading="blogsLoading" @click="loadHotBlogs">刷新热榜</el-button>
         </div>
         <div class="blog-list">
           <article v-for="blog in hotBlogs" :key="blog.id" class="blog-card hover-lift">
@@ -73,14 +74,15 @@
               </div>
             </div>
             <div class="blog-actions">
-              <el-button size="small" @click="openBlogDetail(blog)">查看详情</el-button>
+              <el-button size="small" :disabled="pendingIds.has(String(blog.id))" @click="openBlogDetail(blog)">查看详情</el-button>
               <el-button
                 size="small"
                 :type="blog.isLike ? 'success' : 'primary'"
+                :loading="pendingIds.has(String(blog.id))"
                 plain
                 @click="toggleBlogLike(blog)"
               >
-                {{ blog.isLike ? '已点赞' : '点赞' }}
+                {{ likeLabel(blog) }}
               </el-button>
             </div>
           </article>
@@ -106,8 +108,8 @@
         <p class="detail-content">{{ activeBlog.content || '暂无详细内容' }}</p>
         <div class="detail-footer-actions">
           <el-button v-if="activeBlog.shopId" @click="goShop(activeBlog.shopId)">去店铺</el-button>
-          <el-button :type="activeBlog.isLike ? 'success' : 'primary'" @click="toggleBlogLike(activeBlog)">
-            {{ activeBlog.isLike ? '已点赞' : '点赞' }}
+          <el-button :type="activeBlog.isLike ? 'success' : 'primary'" :loading="pendingIds.has(String(activeBlog.id))" @click="toggleBlogLike(activeBlog)">
+            {{ likeLabel(activeBlog) }}
           </el-button>
         </div>
       </div>
@@ -125,6 +127,7 @@ import CategoryGrid from '@/components/home/CategoryGrid.vue';
 import ShopCard from '@/components/common/ShopCard.vue';
 import { homeApi } from '@/api/modules/home';
 import { blogApi } from '@/api/modules/blog';
+import { useBlogLikes } from '@/composables/useBlogLikes';
 import { useAiStore } from '@/store/ai';
 import { useUserStore } from '@/store/user';
 
@@ -145,6 +148,29 @@ const mergedShops = ref([]);
 const hotBlogs = ref([]);
 const detailDialogVisible = ref(false);
 const activeBlog = ref(null);
+const blogsLoading = ref(false);
+let hotRequestId = 0;
+let blogRevision = 0;
+let detailRequestId = 0;
+const getBlogSession = () => `${userStore.token}:${userStore.profile?.id || ''}`;
+const { pendingIds, uncertainIds, toggle, refresh, reset } = useBlogLikes({
+  api: blogApi,
+  getSession: getBlogSession,
+  onUpdate(detail) {
+    blogRevision += 1;
+    patchBlog(detail.id, { liked: detail.liked, isLike: Boolean(detail.isLike) });
+  }
+});
+
+watch(getBlogSession, () => {
+  reset();
+  blogRevision += 1;
+  detailRequestId += 1;
+  detailDialogVisible.value = false;
+  activeBlog.value = null;
+  hotBlogs.value = [];
+  loadHotBlogs();
+});
 
 const touchStartY = ref(0);
 const pullDistance = ref(0);
@@ -163,6 +189,9 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  reset();
+  hotRequestId += 1;
+  detailRequestId += 1;
   window.removeEventListener('scroll', handleScroll);
 });
 
@@ -201,11 +230,23 @@ async function loadMore() {
 }
 
 async function loadHotBlogs() {
+  const requestId = ++hotRequestId;
+  const revision = blogRevision;
+  const session = getBlogSession();
+  blogsLoading.value = true;
   try {
     const list = await blogApi.getHot(1);
-    hotBlogs.value = (list || []).map(normalizeBlog);
-  } catch {
-    hotBlogs.value = [];
+    if (requestId !== hotRequestId || revision !== blogRevision || session !== getBlogSession()) return;
+    hotBlogs.value = (list || []).map((blog) => {
+      const current = hotBlogs.value.find((item) => String(item.id) === String(blog.id));
+      return pendingIds.value.has(String(blog.id)) && current ? current : normalizeBlog(blog);
+    });
+  } catch (error) {
+    if (requestId === hotRequestId && session === getBlogSession()) {
+      ElMessage.error(error?.message || '加载热榜失败，请刷新重试');
+    }
+  } finally {
+    if (requestId === hotRequestId) blogsLoading.value = false;
   }
 }
 
@@ -231,31 +272,40 @@ async function toggleBlogLike(blog) {
     userStore.openLoginDialog();
     return;
   }
-  try {
-    await blogApi.toggleLike(blog.id);
-    const nextIsLike = !blog.isLike;
-    const nextLiked = Math.max(0, Number(blog.liked || 0) + (nextIsLike ? 1 : -1));
-    patchBlog(blog.id, { isLike: nextIsLike, liked: nextLiked });
-    ElMessage.success(nextIsLike ? '点赞成功' : '已取消点赞');
-  } catch (error) {
-    ElMessage.error(error?.message || '更新点赞状态失败');
+  blogRevision += 1;
+  const result = await toggle(blog.id);
+  if (result.status === 'updated') {
+    ElMessage.success(result.detail.isLike ? '点赞成功' : '已取消点赞');
+  } else if (result.status === 'refreshed') {
+    ElMessage.success('已刷新点赞状态');
+  } else if (result.status === 'unconfirmed') {
+    ElMessage.warning(result.submitted ? '点赞请求已成功，状态查询失败，请点击刷新状态' : '点赞状态暂未确认，请点击刷新状态');
+  } else if (result.status === 'failed') {
+    ElMessage.error(result.error?.message || '更新点赞状态失败');
   }
 }
 
+function likeLabel(blog) {
+  return uncertainIds.value.has(String(blog.id)) ? '刷新状态' : blog.isLike ? '已点赞' : '点赞';
+}
+
 function patchBlog(blogId, patch) {
-  hotBlogs.value = hotBlogs.value.map((item) => (Number(item.id) === Number(blogId) ? { ...item, ...patch } : item));
-  if (activeBlog.value && Number(activeBlog.value.id) === Number(blogId)) {
+  hotBlogs.value = hotBlogs.value.map((item) => (String(item.id) === String(blogId) ? { ...item, ...patch } : item));
+  if (activeBlog.value && String(activeBlog.value.id) === String(blogId)) {
     activeBlog.value = { ...activeBlog.value, ...patch };
   }
 }
 
 async function openBlogDetail(blog) {
-  try {
-    const detail = await blogApi.getDetail(blog.id);
-    activeBlog.value = normalizeBlog({ ...blog, ...detail });
+  const requestId = ++detailRequestId;
+  blogRevision += 1;
+  const result = await refresh(blog.id);
+  if (requestId !== detailRequestId) return;
+  if (result.status === 'refreshed') {
+    activeBlog.value = normalizeBlog({ ...blog, ...result.detail });
     detailDialogVisible.value = true;
-  } catch (error) {
-    ElMessage.error(error?.message || '加载笔记详情失败');
+  } else if (result.status === 'failed' || result.status === 'unconfirmed') {
+    ElMessage.error(result.error?.message || '加载笔记详情失败');
   }
 }
 

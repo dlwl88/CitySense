@@ -5,6 +5,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "test": "node --test test/*.test.js",
     "dev": "vite --config vite.config.cjs",
     "build": "vite build --config vite.config.cjs",
     "build:backend": "vite build --config vite.config.cjs",

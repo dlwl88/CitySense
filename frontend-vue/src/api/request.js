@@ -25,7 +25,9 @@ service.interceptors.response.use(
     const payload = response.data;
     if (payload && typeof payload.success === 'boolean') {
       if (!payload.success) {
-        return Promise.reject(new Error(payload.errorMsg || '请求失败'));
+        const error = new Error(payload.errorMsg || '请求失败');
+        error.isBusinessError = true;
+        return Promise.reject(error);
       }
       return payload.data;
     }
